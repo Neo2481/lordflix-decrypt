@@ -1,0 +1,15 @@
+{
+  "name": "lordflix-decrypt-api",
+  "version": "1.0.0",
+  "description": "API to decrypt LordFlix RSA-2048 encrypted data via headless browser MITM",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^22.0.0",
+    "cors": "^2.8.5"
+  }
+}
