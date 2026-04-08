@@ -7,18 +7,10 @@
  *   2. Calls it DIRECTLY for every request — no reloads, no interception
  *   3. ~100ms per decrypt instead of ~5-8s
  *
- * How it works:
- *   - Hook WebAssembly.instantiateStreaming → capture instance
- *   - Call instance.exports.q3v() → get function table Td
- *   - Td[358] is the RSA-2048 decrypt function
- *   - Store it on window → call it directly for every API request
- *
  * Env vars:
  *   PORT        – listen port            (default 3456)
  *   HEADLESS    – show browser window    (default true)
  *   INIT_URL    – LordFlix URL to load   (default https://lordflix.org)
- *                 Must be a page that triggers the Wasm to load
- *                 (any movie/show page works — the API auto-navigates)
  *   TIMEOUT     – per-request timeout ms (default 15000)
  */
 
@@ -34,14 +26,13 @@ const TIMEOUT  = parseInt(process.env.TIMEOUT || '15000', 10);
 // ─── Hook script — captures the decrypt function from Wasm ────
 const HOOK_SCRIPT = `
 window.__lf = {
-    decryptFn: null,      // Td[358] — the RSA decrypt function
+    decryptFn: null,
     ready: false,
     captureLog: [],
     wasmLoaded: false,
     callCount: 0
 };
 
-// Hook WebAssembly.instantiateStreaming to capture the Wasm instance
 const __origIST = WebAssembly.instantiateStreaming;
 WebAssembly.instantiateStreaming = async function(source, imports) {
     const result = await __origIST.call(WebAssembly, source, imports);
@@ -49,7 +40,6 @@ WebAssembly.instantiateStreaming = async function(source, imports) {
         const exports = result.instance.exports;
         window.__lf.captureLog.push('instance captured, exports: ' + Object.keys(exports).join(', '));
 
-        // q3v() returns the function table Td — Td[358] is the decrypt function
         if (typeof exports.q3v === 'function') {
             const Td = exports.q3v();
             window.__lf.captureLog.push('q3v() called, type: ' + typeof Td);
@@ -60,7 +50,6 @@ WebAssembly.instantiateStreaming = async function(source, imports) {
                 window.__lf.wasmLoaded = true;
                 window.__lf.captureLog.push('Td[358] captured successfully!');
             } else if (Td && typeof Td === 'function') {
-                // Sometimes q3v returns something unexpected — log it
                 window.__lf.captureLog.push('q3v returned function, trying index...');
             }
         }
@@ -70,7 +59,6 @@ WebAssembly.instantiateStreaming = async function(source, imports) {
     return result;
 };
 
-// Also hook WebAssembly.instantiate (fallback)
 const __origI = WebAssembly.instantiate;
 WebAssembly.instantiate = async function(moduleSource, imports) {
     const result = await __origI.call(WebAssembly, moduleSource, imports);
@@ -128,7 +116,6 @@ async function getPage() {
         const br = await getBrowser();
         page = await br.newPage();
 
-        // Block frame_ant.js (anti-bot)
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             if (req.url().includes('frame_ant')) {
@@ -138,10 +125,9 @@ async function getPage() {
             req.continue();
         });
 
-        // Inject hook before any page JS runs
         await page.evaluateOnNewDocument(HOOK_SCRIPT);
+        await page.evaluate(HOOK_SCRIPT);
 
-        // Realistic browser fingerprint
         await page.setViewport({ width: 1366, height: 768 });
         await page.setUserAgent(
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -154,7 +140,6 @@ async function getPage() {
 async function ensureReady() {
     const pg = await getPage();
 
-    // Check if already ready
     const status = await pg.evaluate(() => ({
         ready: window.__lf.ready,
         wasmLoaded: window.__lf.wasmLoaded,
@@ -167,7 +152,6 @@ async function ensureReady() {
     }
 
     if (initializing) {
-        // Wait for other initialization to finish
         for (let i = 0; i < 60; i++) {
             await new Promise(r => setTimeout(r, 500));
             const check = await pg.evaluate(() => window.__lf.ready);
@@ -184,18 +168,15 @@ async function ensureReady() {
         console.log('[Init] Navigating to ' + INIT_URL);
         await pg.goto(INIT_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-        // Check if Wasm loaded on this page
         let check = await pg.evaluate(() => window.__lf.ready);
         if (check) {
             console.log('[Init] Wasm loaded on initial page');
             return;
         }
 
-        // Wasm is loaded lazily — find a movie/show link and click it
         console.log('[Init] Wasm not loaded yet — looking for a content link...');
 
         const linkFound = await pg.evaluate(() => {
-            // Find movie/show links on the page
             const links = Array.from(document.querySelectorAll('a[href]'));
             const contentLink = links.find(a => {
                 const href = a.getAttribute('href') || '';
@@ -206,7 +187,6 @@ async function ensureReady() {
                 contentLink.click();
                 return contentLink.getAttribute('href');
             }
-            // Fallback: any internal link
             const anyLink = links.find(a => {
                 const href = a.getAttribute('href') || '';
                 return href.startsWith('/') && href.length > 2;
@@ -225,7 +205,6 @@ async function ensureReady() {
             console.log('[Init] No content link found — trying homepage categories...');
         }
 
-        // Poll for Wasm to load
         for (let i = 0; i < 30; i++) {
             await new Promise(r => setTimeout(r, 500));
             check = await pg.evaluate(() => window.__lf.ready);
@@ -237,10 +216,9 @@ async function ensureReady() {
             }
         }
 
-        // Still not ready — dump debug info
         const log = await pg.evaluate(() => window.__lf.captureLog);
         console.log('[Init] Capture log:', log);
-        throw new Error('Wasm did not load. Navigate to a movie/show page manually or set INIT_URL to a content page URL.');
+        throw new Error('Wasm did not load. Set INIT_URL to a movie/show page URL.');
 
     } finally {
         initializing = false;
@@ -259,7 +237,6 @@ async function decryptDirect(encryptedData) {
 
         try {
             window.__lf.callCount++;
-            // Call Td[358](data) directly — this is the RSA-2048 decrypt
             const decrypted = window.__lf.decryptFn(data);
             return { success: true, data: decrypted };
         } catch(e) {
@@ -277,7 +254,6 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.text({ type: 'text/plain', limit: '1mb' }));
 app.use(express.urlencoded({ limit: '1mb', extended: false }));
 
-// Health check + status
 app.get('/', async (_req, res) => {
     let status = 'not initialized';
     let callCount = 0;
@@ -311,7 +287,6 @@ app.get('/', async (_req, res) => {
     });
 });
 
-// Status endpoint
 app.get('/status', async (_req, res) => {
     try {
         if (page && !page.isClosed()) {
@@ -330,7 +305,6 @@ app.get('/status', async (_req, res) => {
     }
 });
 
-// Manual init
 app.post('/init', async (_req, res) => {
     try {
         await ensureReady();
@@ -340,11 +314,9 @@ app.post('/init', async (_req, res) => {
     }
 });
 
-// Main decrypt endpoint
 app.post('/decrypt', async (req, res) => {
     const startTime = Date.now();
 
-    // Accept: JSON {"data":"..."}, raw text, or form field
     let encryptedData;
     if (typeof req.body === 'string') {
         encryptedData = req.body.trim();
@@ -405,13 +377,9 @@ async function start() {
     console.log('║  POST /decrypt  →  Decrypt data                 ║');
     console.log('║  GET  /status   →  Check readiness              ║');
     console.log('║  POST /init     →  Trigger initialization        ║');
-    console.log('║                                                  ║');
-    console.log('║  First request auto-initializes by navigating    ║');
-    console.log('║  to the site and capturing the Wasm decrypt fn   ║');
     console.log('╚══════════════════════════════════════════════════╝');
     console.log('');
 
-    // Pre-launch browser
     try {
         await getBrowser();
         console.log('[Browser] Ready');
