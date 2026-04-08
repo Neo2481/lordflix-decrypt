@@ -1,118 +1,209 @@
-# LordFlix Decrypt Toolkit
+# LordFlix Decrypt API v2
 
-Complete toolkit for decrypting LordFlix RSA-2048 encrypted data.
+**Standalone decryption API** — call the site's Kotlin/Wasm RSA-2048 decryptor directly.
+No MITM interception, no page reloads per request. ~100ms per decrypt.
 
-## Folder Structure
+## How It Works
 
 ```
-lordflix-toolkit/
-├── README.md                 ← This file
-├── decrypt-api/              ← Express API (recommended, works)
-│   ├── server.js             ← API server — captures Wasm fn, calls directly
-│   ├── package.json          ← Dependencies: express, puppeteer, cors
-│   └── README.md             ← API docs
-├── tampermonkey/             ← Browser userscript (works on-site)
-│   └── LordFlix-Decryptor.user.js   ← Floating panel UI
-├── standalone/               ← Wasm standalone attempt (research)
-│   ├── decrypt.js            ← Full browser polyfills + Wasm load
-│   ├── test.js               ← Minimal polyfills test
-│   ├── parse-wasm.js         ← Parse Wasm binary (imports/exports)
-│   ├── hxqvpnrw.wasm         ← Wasm binary (46,652 bytes)
-│   └── package.json
-├── wasm/
-│   └── hxqvpnrw.wasm         ← Wasm binary copy
-└── reference/
-    └── N0f0gQZp.js           ← LordFlix main JS (obfuscated, for analysis)
+                    Your Code
+                        │
+                   POST /decrypt
+                        │
+                  ┌─────▼──────┐
+                  │  Express    │
+                  │  API Server │
+                  └─────┬──────┘
+                        │
+                  ┌─────▼──────┐      First request only:
+                  │  Puppeteer │──────► Navigate to lordflix.org
+                  │  (Chrome)  │      Hook WebAssembly.instantiateStreaming
+                  └─────┬──────┘      Capture Td[358] (decrypt function)
+                        │
+                   All subsequent requests:
+                        │
+                  ┌─────▼──────┐
+                  │ Call Td[358]│◄── Direct Wasm function call
+                  │ (encrypted) │    No page reload, no MITM
+                  └─────┬──────┘
+                        │
+                  ┌─────▼──────┐
+                  │  Decrypted │
+                  │  JSON back │
+                  └────────────┘
 ```
 
-## Quick Start
+### Why can't we extract the RSA key?
 
-### Option 1: Express API (Recommended)
+The private key is compiled into a **Kotlin/Wasm binary** using the **Wasm GC proposal**.
+Current tools (`wasm2wat`, `wasm-decompile`) don't support GC, so the binary is opaque.
+The key exists only as arithmetic operations inside machine code — impossible to extract.
+
+### Why this works
+
+We don't extract the key. Instead, we **borrow the site's own decryptor**:
+1. Load the site once → Wasm loads → we capture the decrypt function reference
+2. Call it directly like a library function
+3. The RSA decryption happens inside the Wasm, result comes back to JS
+
+## Install
 
 ```bash
-cd decrypt-api
+cd lordflix-decrypt-api
 npm install
-node server.js
-# API runs on http://localhost:3456
+```
 
-# Decrypt:
+## Configure
+
+| Variable    | Default               | Description                                    |
+|-------------|-----------------------|------------------------------------------------|
+| `PORT`      | `3456`                | API listen port                                |
+| `HEADLESS`  | `true`                | Set `false` to see browser (debugging)         |
+| `INIT_URL`  | `https://lordflix.org`| URL to load. API auto-finds movie links.        |
+| `TIMEOUT`   | `15000`               | Per-request timeout (ms)                       |
+
+## Run
+
+```bash
+# Start the API
+node server.js
+
+# With visible browser (debugging)
+HEADLESS=false node server.js
+
+# Development mode (auto-restart)
+node --watch server.js
+```
+
+On first decrypt request, the API automatically:
+1. Opens lordflix.org in headless Chrome
+2. Finds and clicks a movie/show link
+3. Captures the Wasm decrypt function
+4. Returns ready for direct calls
+
+## Usage
+
+### cURL
+
+```bash
+# Decrypt
 curl -X POST http://localhost:3456/decrypt \
   -H "Content-Type: application/json" \
   -d '{"data": "to9hug8ru6jTsvU6uyGpeeBtT3HRutnbqeHA+RWZ..."}'
+
+# Check status
+curl http://localhost:3456/status
+
+# Manual init
+curl -X POST http://localhost:3456/init
 ```
 
-- Loads lordflix.org ONCE on startup via headless Chrome
-- Captures Wasm decrypt function (Td[358])
-- Subsequent requests: ~100ms, no page reloads
+### JavaScript
 
-### Option 2: Tampermonkey Script
+```js
+const resp = await fetch('http://localhost:3456/decrypt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: 'to9hug8ru6jTsvU6...' })
+});
+const result = await resp.json();
 
-1. Install Tampermonkey browser extension
-2. Open `tampermonkey/LordFlix-Decryptor.user.js`
-3. Install the script
-4. Visit lordflix.org — floating panel appears top-right
-5. Paste encrypted data, click Decrypt
-
-## Technical Summary
-
-### Encryption
-- **Algorithm**: RSA-2048 (PKCS#1 v1.5 padding)
-- **Engine**: Kotlin compiled to WebAssembly (Wasm GC proposal)
-- **Wasm file**: `hxqvpnrw.wasm` (46,652 bytes)
-- **Private key**: Baked into compiled Wasm — cannot be extracted
-
-### Decryption Call Chain
-```
-Encrypted JSON: {"data": "base64_encrypted_string"}
-    │
-    ▼
-W2(data) → y6(data) → T6() → q3v() → Td[358](data) → JSON.parse(result)
+if (result.success) {
+    const streamData = JSON.parse(result.decrypted);
+    console.log(streamData.stream[0].playlist);
+    // → https://api.lordflix.org/...
+}
 ```
 
-### Wasm Module Details
+### Python
+
+```python
+import requests, json
+
+resp = requests.post('http://localhost:3456/decrypt', json={
+    'data': 'to9hug8ru6jTsvU6...'
+})
+result = resp.json()
+if result['success']:
+    data = json.loads(result['decrypted'])
+    print(data['stream'][0]['playlist'])
+```
+
+### Any language with HTTP
+
+```
+POST http://localhost:3456/decrypt
+Content-Type: application/json
+
+{"data": "<encrypted_string>"}
+```
+
+## Response Format
+
+**Success (200):**
+```json
+{
+    "success": true,
+    "decrypted": "{\"stream\":[{\"type\":\"hls\",\"id\":\"primary\",\"playlist\":\"https://...\"}]}",
+    "time_ms": 87
+}
+```
+
+**Error (500):**
+```json
+{
+    "success": false,
+    "error": "Decrypt function not available",
+    "time_ms": 5000
+}
+```
+
+## API Endpoints
+
+| Method | Path        | Description                     |
+|--------|-------------|---------------------------------|
+| `POST` | `/decrypt`  | Decrypt encrypted data          |
+| `GET`  | `/status`   | Check if decrypt function ready |
+| `POST` | `/init`     | Trigger initialization          |
+| `GET`  | `/`         | API info + status               |
+
+## v1 → v2 Changes
+
+| Feature           | v1 (MITM)        | v2 (Direct Calls)  |
+|-------------------|------------------|--------------------|
+| Approach          | Response.json() MITM + page reload | Direct Wasm function call |
+| Speed per decrypt | 5-8 seconds      | ~50-200ms          |
+| Page reloads      | Every request    | Once (on init)     |
+| Network traffic   | Full page load   | None after init    |
+| Reliability       | High             | High               |
+
+## Architecture Deep Dive
+
+### Call Chain (what happens inside the Wasm)
+
+```
+Td[358](encryptedString)
+  └─► jsExportStringToWasm(string)     ← JS→Wasm string conversion
+      └─► RSA-2048 private key decrypt
+          └─► PKCS#1 v1.5 unpadding
+              └─► UTF-8 decode
+                  └─► return JSON string
+```
+
+### Wasm Module Info
+
+- **File**: `hxqvpnrw.wasm` (46,652 bytes)
+- **Language**: Kotlin compiled to WebAssembly (GC proposal)
 - **Exports**: `q3v`, `main`, `memory`, `_initialize`, `startUnitTests`
-- **Import modules**: `js_code` (9 Kotlin interop functions) + `intrinsics` (empty)
-- **Decrypt function**: `q3v()` returns function table `Td`, index `358` is RSA decrypt
-- **Key functions**:
-  - `jsExportStringToWasm` — Pass JS string into Wasm
-  - `importStringFromWasm` — Get JS string out of Wasm
-  - `throwJsError` — Error handling
+- **Imports**: `js_code` (14 Kotlin interop functions) + `intrinsics` (empty)
+- **Decrypt function**: `q3v()[358]` — the 359th entry in the function table
 
-### Why Can't We Write Our Own Decrypt Code?
+## Troubleshooting
 
-1. **RSA private key is inside compiled Wasm bytecode** — not a separate file
-2. **Wasm uses GC proposal** — `wasm2wat`, `wasm-decompile` all fail
-3. **Exports are frozen** — `writable:false, configurable:false`, cannot Proxy
-4. **Standalone Wasm throws WebAssembly.Exception** — native Wasm exception, JS cannot catch it
-5. **Clone attempt** (v12) did decrypt but threw exception after — result lost
-6. **Memory scan** found 0 strings, 0 readable patterns — key is pure arithmetic ops
-
-### Versions Tried (20+ Tampermonkey scripts)
-- v1-v5: Basic MITM approaches — failed
-- v6-v8: Wasm export freezing — exports immutable
-- v9-v10: Clone q3v() — returns undefined without init
-- v11-v13: Clone with init — decrypts but throws WebAssembly.Exception
-- v14-v15: Interop hooks — not triggered on clone
-- v16-v18: Memory scan — nothing readable
-- v19: Intermediate MITM
-- **v20: SUCCESS** — Response.json() MITM + sessionStorage
-- **API v1**: MITM + page reload per request (~5-8s)
-- **API v2: SUCCESS** — Direct Td[358] call (~100ms) — current version
-
-## API Endpoints (v2)
-
-| Method | Path      | Description                |
-|--------|-----------|----------------------------|
-| `POST` | `/decrypt`| Decrypt encrypted data     |
-| `GET`  | `/status` | Check if decrypt fn ready  |
-| `POST` | `/init`   | Trigger initialization     |
-| `GET`  | `/`       | API info + status          |
-
-## Environment Variables
-
-| Variable   | Default               | Description                  |
-|------------|-----------------------|------------------------------|
-| `PORT`     | `3456`                | API listen port              |
-| `HEADLESS` | `true`                | Set `false` for visible browser |
-| `INIT_URL` | `https://lordflix.org`| URL to load for init         |
-| `TIMEOUT`  | `15000`               | Per-request timeout (ms)     |
+| Problem | Solution |
+|---------|----------|
+| `Wasm did not load` | Set `INIT_URL` to a specific movie/show page URL |
+| `frame_ant.js` errors | Already auto-blocked by the API |
+| `Decrypt function not available` | Call `POST /init` or restart |
+| Slow first request | Expected — needs to load the page. Subsequent requests are fast |
+| Browser crashes | API auto-restarts browser on next request |

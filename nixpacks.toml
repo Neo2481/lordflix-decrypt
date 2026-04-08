@@ -1,0 +1,18 @@
+[phases.setup]
+nixPkgs = ["...", "chromium"]
+
+[phases.install]
+cmds = ["npm ci --production || npm install --production"]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "node server.js"
+
+[variables]
+NIXPACKS_NODE_VERSION = "22"
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
+PUPPETEER_EXECUTABLE_PATH = "/nix/var/nix/profiles/default/bin/chromium"
+NODE_ENV = "production"
+PORT = "3456"
